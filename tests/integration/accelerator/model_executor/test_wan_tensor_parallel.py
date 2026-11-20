@@ -185,8 +185,8 @@ def _relative_error(actual, expected):
 @pytest.mark.rocm
 @pytest.mark.parametrize("batch", [1, 2])
 def test_rocshmem_tp_matches_one_gpu(tmp_path, one_gpu_output, batch):
-    if not hasattr(torch.ops.symm_mem, "rocshmem_all_gather_out"):
-        pytest.skip("requires rocSHMEM fan-out bridge")
+    if not hasattr(torch.ops.symm_mem, "rocshmem_all_gather_chunks_out"):
+        pytest.skip("requires the chunked rocSHMEM fan-out bridge")
     expected = one_gpu_output("wan", PADDED, batch)
     actual = _run(tmp_path, "tp2", "wan", PADDED, "replicated", chunks=2, batch=batch, fused="rocshmem")
     assert _relative_error(actual, expected) <= TOLERANCE

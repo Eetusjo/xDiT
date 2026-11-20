@@ -15,7 +15,6 @@ def _setup(x, group_name, chunks, factor):
     if chunks < 1 or x.shape[1] % (chunks * factor):
         raise ValueError(f"{x.shape[1]} rows do not split evenly into {chunks * factor} pieces")
     compute, comm = torch.cuda.current_stream(x.device), shmem.stream_for(x.device)
-    comm.wait_stream(compute)
     return group, compute, comm
 
 
@@ -26,17 +25,16 @@ def all_gather_linear(
     group, compute, comm = _setup(x, group_name, chunks, 1)
     batch, rows, features = x.shape
     block, world = rows // chunks, group.size()
-    gathered, ready = [], []
+    ready = torch.zeros(chunks, device=x.device, dtype=torch.int64)
+    comm.wait_stream(compute)
     with torch.cuda.stream(comm):
-        for c in range(chunks):
-            shard = x.narrow(1, c * block, block).contiguous()
-            gathered.append(shmem.all_gather_chunk(shard, group, ("tp-ag", c)))
-            ready.append(comm.record_event())
+        gathered = shmem.all_gather_chunks(x.contiguous(), group, chunks, ready)
+    ready.record_stream(comm)
     x.record_stream(comm)
     out = x.new_empty(chunks, batch, world * block, weight.shape[0])
     for c in range(chunks):
-        compute.wait_event(ready[c])
-        a = gathered[c].transpose(0, 1).reshape(-1, features)
+        torch.ops.symm_mem.nvshmem_wait_for_signal(ready[c:c+1], 1, group.rank())
+        a = gathered[c].reshape(-1, features)
         dest = out[c].view(-1, weight.shape[0])
         if bias is None:
             torch.mm(a, weight.t(), out=dest)

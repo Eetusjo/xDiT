@@ -70,3 +70,16 @@ def all_gather_chunk(src, group, slot):
         raise RuntimeError("Cannot reuse a symmetric inbox on a different stream")
     torch.ops.symm_mem.rocshmem_all_gather_out(src, out, *partition)
     return out.view(group.size(), *src.shape)
+
+
+def all_gather_chunks(src, group, chunks, ready):
+    partition = _partition(group)
+    _initialize()
+    if not hasattr(torch.ops.symm_mem, "rocshmem_all_gather_chunks_out"):
+        raise RuntimeError("AsyncTP needs the PyTorch rocSHMEM bridge built with this xDiT kernel revision")
+    out, _, stream = _workspace(group, ("tp-gather", chunks), src.numel() * group.size(), src.dtype, src.device)
+    if torch.cuda.current_stream(src.device) != stream:
+        raise RuntimeError("Cannot reuse a symmetric inbox on a different stream")
+    torch.ops.symm_mem.rocshmem_all_gather_chunks_out(src, out, ready, *partition, chunks)
+    b, rows, features = src.shape
+    return out.view(chunks, b, group.size(), rows // chunks, features)

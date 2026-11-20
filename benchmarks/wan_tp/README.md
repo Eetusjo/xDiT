@@ -20,11 +20,12 @@ TP refuses FP8/FP4/FP6 GEMMs, FP8 comms, step caching, FSDP, PipeFusion and CPU 
 Build the SDMA-enabled PyTorch bridge with this branch's
 `xfuser/core/distributed/sdma/rocshmem_exchange.cu`. The previous Ulysses
 image already supports the one-plane exchange for RS, but lacks the
-`symm_mem::rocshmem_all_gather_out` fan-out operator. For AG, it reads one
-ordinary contiguous source shard and puts it into the sender's slot on every
-peer. For RS the destination-specific tiles are exchanged, then summed locally
-in FP32. PyTorch events order each chunk's transfer against its GEMM, including
-inbox reuse. Both directions use public rocSHMEM APIs, not HSA engine IDs.
+`symm_mem::rocshmem_all_gather_chunks_out` operator. For AG, one posting kernel
+fans each source chunk out to every peer and publishes a local completion word
+once the team has received that chunk. Each GEMM waits for just its own word.
+For RS the destination-specific tiles are exchanged, then summed locally with
+FP32 accumulation. Stream dependencies protect inbox reuse. Both directions
+use public rocSHMEM APIs, not HSA engine IDs.
 
 Start with a single gfx950 node and TP8. Allow enough symmetric heap for the
 cached chunk inboxes (`ROCSHMEM_HEAP_SIZE=6442450944` in the 720p test).
