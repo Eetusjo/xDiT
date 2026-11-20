@@ -65,7 +65,11 @@ def linear_reduce_scatter(
 
     def reduce(c):
         compute.wait_event(ready[c])
-        out[c].copy_(received[c].sum(dim=0, dtype=torch.float32))
+        if x.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            # ATen's GPU reduction accumulates these types in FP32.
+            torch.sum(received[c], dim=0, out=out[c])
+        else:
+            out[c].copy_(received[c].sum(dim=0, dtype=torch.float32))
 
     for c in range(chunks):
         partial = torch.matmul(x.narrow(1, c * span, span), weight.t())
