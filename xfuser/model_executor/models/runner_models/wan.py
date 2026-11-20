@@ -801,6 +801,9 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
         # The TP sharding slices bf16 nn.Linear weights after placement; these replace or
         # wrap those linears, or depend on per-layer state TP does not split.
         unsupported = {
+            "--use_int8_gemms": config.use_int8_gemms,
+            "--attention_a2a": config.attention_a2a != "none",
+            "--ulysses_sdma_overlap_qkv": config.ulysses_sdma_overlap_qkv,
             "--use_fp8_gemms": config.use_fp8_gemms,
             "--use_fp4_gemms": config.use_fp4_gemms,
             "--use_fp6_gemms": config.use_fp6_gemms,
@@ -827,14 +830,14 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
                     f"XDIT_WAN_TP_CROSS_ATTENTION must be 'sharded' or 'replicated'; got {cross_attention!r}."
                 )
             overlap = envs.environment_variables["XDIT_TP_COMM_OVERLAP"]().strip().lower()
-            if overlap not in ("none", "chunked", "symm_mem", "sdma"):
+            if overlap not in ("none", "chunked", "symm_mem", "sdma", "rocshmem"):
                 raise ValueError(
-                    f"XDIT_TP_COMM_OVERLAP must be 'none', 'chunked', 'symm_mem' or 'sdma'; got {overlap!r}."
+                    f"Unknown XDIT_TP_COMM_OVERLAP {overlap!r}; use none, chunked, symm_mem, sdma or rocshmem."
                 )
-            if overlap == "sdma" and torch.version.hip is None:
-                raise ValueError("XDIT_TP_COMM_OVERLAP=sdma needs ROCm (SDMA copy engines).")
+            if overlap in ("sdma", "rocshmem") and torch.version.hip is None:
+                raise ValueError(f"XDIT_TP_COMM_OVERLAP={overlap} needs ROCm.")
             chunks = 1
-            if overlap in ("chunked", "sdma"):
+            if overlap in ("chunked", "sdma", "rocshmem"):
                 raw_chunks = envs.environment_variables["XDIT_TP_OVERLAP_CHUNKS"]()
                 if not raw_chunks.strip().isdigit() or int(raw_chunks) < 2:
                     raise ValueError(f"XDIT_TP_OVERLAP_CHUNKS must be an integer >= 2; got {raw_chunks!r}.")
@@ -849,7 +852,7 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
                 getattr(self.pipe, name).shard_for_tensor_parallel(
                     shard_cross_attention=cross_attention == "sharded",
                     overlap_chunks=chunks,
-                    fused_comm=overlap if overlap in ("symm_mem", "sdma") else None,
+                    fused_comm=overlap if overlap in ("symm_mem", "sdma", "rocshmem") else None,
                 )
             torch.cuda.empty_cache()
 

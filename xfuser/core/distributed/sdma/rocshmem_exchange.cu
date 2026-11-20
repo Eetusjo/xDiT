@@ -33,13 +33,15 @@ rocshmem_team_t exchange_team(int first, int stride, int size) {
   return local;
 }
 
-__global__ void exchange(const char* src, char* dst, size_t bytes, int planes, rocshmem_team_t team) {
+__global__ void exchange(const char* src, char* dst, size_t bytes, int planes, rocshmem_team_t team,
+                         bool replicate) {
   const int peers = rocshmem_team_n_pes(team), sender = rocshmem_team_my_pe(team);
   rocshmem_ctx_sync_wg(ROCSHMEM_CTX_DEFAULT, team);  // previous inbox readers have finished
   for (int j = threadIdx.x; j < peers; j += blockDim.x) {
     const int pe = rocshmem_team_translate_pe(team, j, ROCSHMEM_TEAM_WORLD);
     for (int p = 0; p < planes; ++p) {
-      rocshmem_putmem_nbi(dst + (p * peers + sender) * bytes, src + (j * planes + p) * bytes, bytes, pe);
+      rocshmem_putmem_nbi(dst + (p * peers + sender) * bytes,
+                         src + ((replicate ? 0 : j * planes) + p) * bytes, bytes, pe);
     }
     rocshmem_pe_quiet(&pe, 1);
   }
@@ -47,26 +49,35 @@ __global__ void exchange(const char* src, char* dst, size_t bytes, int planes, r
   rocshmem_ctx_sync_wg(ROCSHMEM_CTX_DEFAULT, team);
 }
 
-void exchange_planes(const at::Tensor& src, at::Tensor& out, int64_t first, int64_t stride, int64_t size,
-                     int64_t planes) {
+void launch(const at::Tensor& src, at::Tensor& out, int64_t first, int64_t stride, int64_t size,
+            int64_t planes, bool replicate) {
   TORCH_CHECK(src.is_cuda() && src.device() == out.device() && src.is_contiguous() && out.is_contiguous());
-  TORCH_CHECK(src.scalar_type() == out.scalar_type() && src.numel() == out.numel() && !src.is_alias_of(out));
-  TORCH_CHECK(size >= 2 && size <= 8 && (planes == 1 || planes == 3) && src.numel() > 0 &&
-              src.numel() % (size * planes) == 0);
+  TORCH_CHECK(src.scalar_type() == out.scalar_type() && !src.is_alias_of(out));
+  TORCH_CHECK(size >= 2 && size <= 8 && (planes == 1 || planes == 3) && out.numel() > 0 &&
+              out.numel() % (size * planes) == 0 && src.numel() == out.numel() / (replicate ? size : 1));
   c10::cuda::CUDAGuard guard(src.device());
   auto handle = c10d::symmetric_memory::rendezvous(out, "0");
   TORCH_CHECK(handle && handle->world_within_direct_access(), "destination must be a symmetric IPC tensor");
   auto team = exchange_team(first, stride, size);
   hipLaunchKernelGGL(exchange, dim3(1), dim3(64), 0, at::cuda::getCurrentCUDAStream(),
                      static_cast<const char*>(src.const_data_ptr()), static_cast<char*>(out.mutable_data_ptr()),
-                     src.nbytes() / (size * planes), static_cast<int>(planes), team);
+                     out.nbytes() / (size * planes), static_cast<int>(planes), team, replicate);
   C10_HIP_CHECK(hipGetLastError());
+}
+void exchange_planes(const at::Tensor& src, at::Tensor& out, int64_t first, int64_t stride, int64_t size,
+                     int64_t planes) {
+  launch(src, out, first, stride, size, planes, false);
+}
+void all_gather_out(const at::Tensor& src, at::Tensor& out, int64_t first, int64_t stride, int64_t size) {
+  launch(src, out, first, stride, size, 1, true);
 }
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(symm_mem, m) {
   m.def("rocshmem_exchange_planes(Tensor src, Tensor(a!) out, int first, int stride, int size, int planes) -> ()");
+  m.def("rocshmem_all_gather_out(Tensor src, Tensor(a!) out, int first, int stride, int size) -> ()");
 }
 TORCH_LIBRARY_IMPL(symm_mem, CUDA, m) {
   m.impl("rocshmem_exchange_planes", exchange_planes);
+  m.impl("rocshmem_all_gather_out", all_gather_out);
 }

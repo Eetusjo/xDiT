@@ -80,6 +80,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     #   sdma    - ROCm: each all-gather + GEMM with the gather on SDMA copy engines, all peers at
     #             once, in XDIT_TP_OVERLAP_CHUNKS pieces whose GEMMs start as they land
     #             (layers/sdma_all_gather.py); reduce-scatters as with chunked.
+    #   rocshmem - both directions on rocSHMEM SDMA with per-chunk stream events.
     "XDIT_TP_COMM_OVERLAP": lambda: os.environ.get("XDIT_TP_COMM_OVERLAP", "none"),
     "XDIT_TP_OVERLAP_CHUNKS": lambda: os.environ.get("XDIT_TP_OVERLAP_CHUNKS", "4"),
     # For sdma: what releases the copies (gpu: a kernel after the symmetric-memory barrier; host:
@@ -101,7 +102,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "XDIT_TP_SDMA_ALLOW_UNTESTED": lambda: os.environ.get("XDIT_TP_SDMA_ALLOW_UNTESTED", "0"),
     # For sdma: a prebuilt transport library (python -m xfuser.model_executor.layers.sdma_all_gather
     # build); unset, it is built with hipcc on first use and cached.
-    "XDIT_SDMA_LIB": lambda: os.environ.get("XDIT_SDMA_LIB", ""),
+    "XDIT_TP_SDMA_LIB": lambda: os.environ.get("XDIT_TP_SDMA_LIB", ""),
 }
 
 

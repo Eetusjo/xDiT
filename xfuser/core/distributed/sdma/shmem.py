@@ -57,3 +57,16 @@ def exchange(src, group, slot, planes=False):
 
 def use_planes(ex):
     return ex.batch == 1 and ex.tensors == 3 and len(set(ex.rows)) == len(set(ex.heads)) == 1
+
+
+def all_gather_chunk(src, group, slot):
+    """Fan out a contiguous shard; receive one shard per sender in rank order."""
+    partition = _partition(group)
+    _initialize()
+    if not hasattr(torch.ops.symm_mem, "rocshmem_all_gather_out"):
+        raise RuntimeError("AsyncTP needs the PyTorch rocSHMEM bridge built with this xDiT kernel revision")
+    out, _, stream = _workspace(group, slot, src.numel() * group.size(), src.dtype, src.device)
+    if torch.cuda.current_stream(src.device) != stream:
+        raise RuntimeError("Cannot reuse a symmetric inbox on a different stream")
+    torch.ops.symm_mem.rocshmem_all_gather_out(src, out, *partition)
+    return out.view(group.size(), *src.shape)

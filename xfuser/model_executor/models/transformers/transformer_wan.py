@@ -685,8 +685,8 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
         each all-gather + GEMM on SDMA copy engines in `overlap_chunks` pieces
         (layers/sdma_all_gather.py), reduce-scatters as with chunks alone.
         """
-        if fused_comm not in (None, "symm_mem", "sdma"):
-            raise ValueError(f"fused_comm must be None, 'symm_mem' or 'sdma'; got {fused_comm!r}")
+        if fused_comm not in (None, "symm_mem", "sdma", "rocshmem"):
+            raise ValueError(f"Unsupported Wan TP communication mode {fused_comm!r}")
         if fused_comm == "symm_mem" and overlap_chunks != 1:
             raise ValueError("fused_comm='symm_mem' pipelines on its own; it takes no overlap_chunks")
         tp_size = get_tensor_model_parallel_world_size()

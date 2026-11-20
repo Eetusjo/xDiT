@@ -71,6 +71,7 @@ def _parse_args():
     parser.add_argument("--chunks", nargs="+", type=int, default=[2, 4, 8])
     parser.add_argument("--symm-mem", action="store_true", help="also time torch's fused symm_mem ops")
     parser.add_argument("--sdma", action="store_true", help="also time the SDMA all-gather + GEMM (ROCm)")
+    parser.add_argument("--rocshmem", action="store_true", help="time the rocSHMEM AG + GEMM and GEMM + RS")
     parser.add_argument(
         "--symm-mem-sdma", action="store_true", help="also time torch's symm_mem ops on their patched SDMA path (ROCm)"
     )
@@ -80,7 +81,10 @@ def _parse_args():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--output-dir", default="/output/fusion_bench")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.rocshmem and (args.sdma or args.symm_mem or args.symm_mem_sdma):
+        parser.error("Use separate launches: rocSHMEM selects a process-global symmetric allocator")
+    return args
 
 
 class Bench:
@@ -230,7 +234,7 @@ class Bench:
 
     def check(self, name, actual, expected):
         error = ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
-        if error > 1e-2:
+        if not math.isfinite(error) or error > 1e-2:
             raise AssertionError(f"rank {self.rank}: {name} differs from baseline by {error:.3e}")
 
     def run_site(self, site):
@@ -293,6 +297,25 @@ class Bench:
                 for k in self.args.chunks:
                     self.check(f"sdma_k{k}", self.rs_sdma(a_full, weight, k), self.cyclic_rows(expected_full, k))
                     results[f"sdma_k{k}"] = self.time(lambda: self.rs_sdma(a_full, weight, k))
+        if self.args.rocshmem:
+            from xfuser.model_executor.layers import rocshmem_async_tp as rt
+
+            for k in self.args.chunks:
+                if kind == "ag":
+                    local = self.cyclic_rows(x_full, k).contiguous()[None]
+
+                    def fn():
+                        return rt.all_gather_linear(local, weight, None, self.group_name, k)[0]
+
+                    ref = expected
+                else:
+
+                    def fn():
+                        return rt.linear_reduce_scatter(a_full[None], weight, self.group_name, self.world, k)[0]
+
+                    ref = self.cyclic_rows(expected_full, k)
+                self.check(f"rocshmem_k{k}", fn(), ref)
+                results[f"rocshmem_k{k}"] = self.time(fn)
         results["ideal"] = max(results["comm_only"], results["gemm_only"])
         return results
 
@@ -306,6 +329,7 @@ def _report(bench, table):
         + ([f"symm_mem_sdma_k{k}" for k in args.chunks] if args.symm_mem_sdma else [])
         + ([f"symm_mem_sdma_graph_k{k}" for k in args.chunks] if args.symm_mem_sdma and args.graph else [])
         + ([f"sdma_k{k}" for k in args.chunks] if args.sdma else [])
+        + ([f"rocshmem_k{k}" for k in args.chunks] if args.rocshmem else [])
     )
     columns = ["comm_only", "gemm_only", "ideal", *variants]
     channels = os.environ.get("NCCL_MAX_NCHANNELS", "default")

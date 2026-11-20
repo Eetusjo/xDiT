@@ -73,6 +73,9 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
 
     import torch.distributed._symmetric_memory as symm_mem
 
+    if fused == "rocshmem":
+        os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
+
     if options.get("sdma_reduce_scatter"):
         os.environ["XDIT_TP_SDMA_REDUCE_SCATTER"] = "on"
     torch_sdma = options.get("torch_sdma", False)
@@ -177,6 +180,16 @@ def one_gpu_output(tmp_path_factory):
 
 def _relative_error(actual, expected):
     return ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
+
+
+@pytest.mark.rocm
+@pytest.mark.parametrize("batch", [1, 2])
+def test_rocshmem_tp_matches_one_gpu(tmp_path, one_gpu_output, batch):
+    if not hasattr(torch.ops.symm_mem, "rocshmem_all_gather_out"):
+        pytest.skip("requires rocSHMEM fan-out bridge")
+    expected = one_gpu_output("wan", PADDED, batch)
+    actual = _run(tmp_path, "tp2", "wan", PADDED, "replicated", chunks=2, batch=batch, fused="rocshmem")
+    assert _relative_error(actual, expected) <= TOLERANCE
 
 
 @pytest.mark.parametrize("latent_shape", [UNPADDED, PADDED], ids=["unpadded", "padded"])

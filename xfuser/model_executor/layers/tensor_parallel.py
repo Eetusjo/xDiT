@@ -43,6 +43,7 @@ from torch.profiler import record_function
 
 import xfuser.envs as envs
 from xfuser.core.distributed.parallel_state import get_tp_group
+from xfuser.model_executor.layers import rocshmem_async_tp
 from xfuser.model_executor.layers import sdma_all_gather  # noqa: F401  registers xfuser::tp_sdma_all_gather_linear
 
 
@@ -135,6 +136,11 @@ def tp_column_parallel(
     x: torch.Tensor, linear: nn.Linear, site: str, chunks: int, fused: Optional[str] = None
 ) -> torch.Tensor:
     """`linear` over the TP group's rows of `x` (dim 1): all-gather, then the column-parallel GEMM."""
+    if fused == "rocshmem":
+        with record_function(f"tp_ag:{site}"):
+            return rocshmem_async_tp.all_gather_linear(
+                x, linear.weight, linear.bias, get_tp_group().device_group.group_name, chunks
+            )
     if fused == "sdma":
         with record_function(f"tp_ag:{site}"):
             return torch.ops.xfuser.tp_sdma_all_gather_linear(
@@ -170,7 +176,13 @@ def tp_row_parallel(
     fused: Optional[str] = None,
 ) -> torch.Tensor:
     """Row-parallel `linear` over all rows of `x`, reduce-scattered to this rank's rows, plus `bias` once."""
-    if fused == "symm_mem":
+    if fused == "rocshmem":
+        group = get_tp_group()
+        with record_function(f"tp_rs:{site}"):
+            out = rocshmem_async_tp.linear_reduce_scatter(
+                x, linear.weight, group.device_group.group_name, group.world_size, chunks
+            )
+    elif fused == "symm_mem":
         with record_function(f"tp_rs:{site}"):
             out = torch.ops.symm_mem.fused_matmul_reduce_scatter(
                 x, linear.weight.t(), "sum", 1, get_tp_group().device_group.group_name
