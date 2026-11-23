@@ -237,6 +237,7 @@ class _Call:
         self.parts: List[torch.Tensor] = []
         self.groups: List[torch.Tensor] = []
         self.ready: List[torch.cuda.Event] = []
+        self.side_sources: List[torch.Tensor] = []
 
 
 class _State:
@@ -380,10 +381,10 @@ def send(
                 else:
                     side = shmem.stream_for(src.device)
                     side.wait_stream(torch.cuda.current_stream())
+                    c.side_sources.append(src)
                     with torch.cuda.stream(side):
                         c.groups.append(shmem.exchange(src, process_group, 2 * gi, shmem.use_planes(ex)))
                         c.ready.append(side.record_event())
-                    src.record_stream(side)
             else:
                 c.groups.append(src)
             c.parts = []
@@ -446,7 +447,22 @@ def finish(
         raise RuntimeError("SDMA Ulysses finish before every group was sent")
     state.open = None
     if c.rccl:
-        return _finish_packed(process_group, c.exchange, c.groups, attend, local, c.rocshmem, c.ready)
+        if not c.side_sources:
+            return _finish_packed(process_group, c, attend, local)
+        from . import shmem
+
+        device = c.side_sources[0].device
+        # If attention fails before joining the transfers, they still own the sources.
+        last_reader = shmem.stream_for(device)
+        try:
+            result = _finish_packed(process_group, c, attend, local)
+            # All reads have rejoined this stream. Its allocator can now reuse the sources
+            # in stream order, rather than pinning temporaries for every queued layer.
+            last_reader = torch.cuda.current_stream(device)
+            return result
+        finally:
+            for src in c.side_sources:
+                src.record_stream(last_reader)
     g = transport.group_for(process_group)
     ex, P, r, b, d, G = c.exchange, g.world, g.rank, c.exchange.batch, c.exchange.head_dim, c.exchange.groups
     inbox, outbox, elt = _buffers(g, ex)
@@ -510,8 +526,9 @@ def _outbox(outbox, ex, gi, elt):
     return outbox.local[start : start + P * b * s * h * d * elt].view(ex.dtype).view(P, b, s, h, d)
 
 
-def _finish_packed(process_group, ex, packed, attend, local, rocshmem, ready):
+def _finish_packed(process_group, c, attend, local):
     """Exchange equal blocks on the current stream, preserving the original packed layouts."""
+    ex, packed, rocshmem, ready = c.exchange, c.groups, c.rocshmem, c.ready
 
     def exchange(src, slot):
         if rocshmem:
@@ -557,10 +574,10 @@ def _finish_packed(process_group, ex, packed, attend, local, rocshmem, ready):
 
             side = shmem.stream_for(back.device)
             side.wait_stream(main)
+            c.side_sources.append(back)
             with torch.cuda.stream(side):
                 returned = exchange(back, 2 * gi + 1)
                 done.append(side.record_event())
-            back.record_stream(side)
         else:
             returned = exchange(back, 2 * gi + 1)
         returns.append(returned)

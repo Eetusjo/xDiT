@@ -66,8 +66,13 @@ Both CFG branches must create the same size workspaces in the same order:
 heap allocation is world collective, although the payload stays within each
 team. Use one fixed partition per torchrun job. For large shapes, set
 `ROCSHMEM_HEAP_SIZE` in bytes before torchrun if the default heap is too
-small. Head grouping and `--ulysses_sdma_overlap_qkv` are supported;
+small (FLUX.3 base at 4096², CFG2×U4, was tested with `6442450944`).
+Head grouping and `--ulysses_sdma_overlap_qkv` are supported;
 per-group attention streams and transformer graph capture are not.
+Grouped sends and returns keep their source tensors alive until the compute
+stream has queued the matching waits. This allows temporary buffers to be
+reused across queued layers without synchronizing the host or growing the
+symmetric heap.
 
 Run the following test from a checkout in the image with eight allocated GPUs:
 
