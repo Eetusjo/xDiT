@@ -17,12 +17,17 @@ into tp*chunks blocks, TP rank r holds blocks r, tp+r, 2tp+r, ... Each chunk's
 all-gather output and reduce-scatter input are then contiguous rows of the
 natural order. `tp_split_rows` / `tp_gather_rows` convert between the layouts;
 with one chunk the layout is plain contiguous chunks.
+
+With a fused group, PyTorch's symmetric-memory operators run each pair
+on contiguous, rank-ordered rows. PyTorch owns the internal chunking.
 """
 
+import os
 from typing import List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 import torch.nn.functional as F
 from torch import nn
 from torch.profiler import record_function
@@ -115,8 +120,34 @@ def tp_gather_rows(x: torch.Tensor, chunks: int) -> torch.Tensor:
     return blocks.transpose(1, 2).reshape(batch, rows, *rest)
 
 
-def tp_column_parallel(x: torch.Tensor, linear: nn.Linear, site: str, chunks: int) -> torch.Tensor:
+def fused_tp_group_name() -> str:
+    group = get_tp_group().device_group
+    if torch.version.hip is None:
+        return group.group_name
+    if os.environ.get("TORCH_SYMM_MEM_ROCSHMEM_ASYNC_TP") != "1" or not hasattr(
+        torch.ops.symm_mem, "_rocshmem_gather_slices"
+    ):
+        raise RuntimeError("Wan symm_mem on ROCm needs a rocSHMEM AsyncTP build and TORCH_SYMM_MEM_ROCSHMEM_ASYNC_TP=1")
+    world = dist.group.WORLD
+    if (
+        dist.get_process_group_ranks(group) != dist.get_process_group_ranks(world)
+        or int(os.environ.get("LOCAL_WORLD_SIZE", "0")) != world.size()
+    ):
+        raise ValueError("Wan rocSHMEM AsyncTP requires the entire single-node world in TP rank order")
+    symm_mem.set_backend("NVSHMEM")
+    return world.group_name
+
+
+def tp_column_parallel(
+    x: torch.Tensor, linear: nn.Linear, site: str, chunks: int, fused_group: Optional[str] = None
+) -> torch.Tensor:
     """`linear` over the TP group's rows of `x` (dim 1): all-gather, then the column-parallel GEMM."""
+    if fused_group is not None:
+        with record_function(f"tp_ag:{site}"):
+            _, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(
+                x, [linear.weight.t()], 1, fused_group, return_A=False
+            )
+        return out if linear.bias is None else out + linear.bias
     if chunks == 1:
         return linear(tp_all_gather_seq(x, site))
     group = get_tp_group()
@@ -127,10 +158,18 @@ def tp_column_parallel(x: torch.Tensor, linear: nn.Linear, site: str, chunks: in
 
 
 def tp_row_parallel(
-    x: torch.Tensor, linear: nn.Linear, bias: Optional[torch.Tensor], site: str, chunks: int
+    x: torch.Tensor,
+    linear: nn.Linear,
+    bias: Optional[torch.Tensor],
+    site: str,
+    chunks: int,
+    fused_group: Optional[str] = None,
 ) -> torch.Tensor:
     """Row-parallel `linear` over all rows of `x`, reduce-scattered to this rank's rows, plus `bias` once."""
-    if chunks == 1:
+    if fused_group is not None:
+        with record_function(f"tp_rs:{site}"):
+            out = torch.ops.symm_mem.fused_matmul_reduce_scatter(x, linear.weight.t(), "sum", 1, fused_group)
+    elif chunks == 1:
         out = tp_reduce_scatter_seq(linear(x), site)
     else:
         group = get_tp_group()

@@ -47,6 +47,31 @@ host-issued copies cannot replay; other components can retain their graphs.
 `XDIT_SDMA_WAIT_S` sets the wait timeout in seconds (default 30).
 `XDIT_SDMA_ALLOW_UNTESTED=1` permits other GPU architectures.
 
+## Wan tensor parallelism with PyTorch symmetric memory
+
+Wan2.2 T2V can run all-gather with column-parallel GEMM and row-parallel GEMM
+with reduce-scatter through PyTorch's fused symmetric-memory operators.
+The default is separate collectives and GEMMs. In fused mode each TP rank owns
+contiguous sequence rows; PyTorch, not `XDIT_TP_OVERLAP_CHUNKS`, schedules transfers.
+
+On ROCm this mode requires a PyTorch build with the experimental rocSHMEM
+AsyncTP backend, launched with torchrun on a single peer-connected node.
+The TP group must cover the entire world in rank order. For eight GPUs:
+
+```bash
+XDIT_TP_COMM_OVERLAP=symm_mem TORCH_SYMM_MEM_ROCSHMEM_ASYNC_TP=1 \
+XDIT_WAN_TP_CROSS_ATTENTION=replicated ROCSHMEM_SDMA_ENABLED=1 \
+ROCSHMEM_HEAP_SIZE=6442450944 torchrun --standalone --nproc-per-node=8 \
+    -m xfuser.runner --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --tensor_parallel_degree 8 --attention_backend AITER_BF16 --use_torch_compile \
+    --height 720 --width 1280 --num_frames 81 --num_inference_steps 40 \
+    --guidance_scale 3.5 --prompt "A cat walking on grass"
+```
+
+Replicated cross-attention trades additional weight memory for fewer collectives.
+The symmetric heap size is in bytes; other shapes can require a different size.
+This mode does not load xDiT's ROCr Ulysses library.
+
 ## FP8 communication
 
 Q, K, and V are the attention queries, keys, and values.

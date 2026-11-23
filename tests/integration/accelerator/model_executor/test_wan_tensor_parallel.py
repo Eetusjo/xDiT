@@ -92,7 +92,9 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         # Seeded on the CPU, so every process builds the same weights.
         torch.manual_seed(0)
         model = xFuserWanTransformer3DWrapper(**_TINY_CONFIG).eval().to(device=device, dtype=torch.float32)
-        model.shard_for_tensor_parallel(shard_cross_attention=cross_attention == "sharded", overlap_chunks=chunks)
+        model.shard_for_tensor_parallel(
+            shard_cross_attention=cross_attention == "sharded", overlap_chunks=chunks, fused_comm=options["fused"]
+        )
         if tp > 1:
             heads = _TINY_CONFIG["num_attention_heads"]
             assert all(isinstance(block, xFuserWanTPTransformerBlock) for block in model.blocks)
@@ -112,10 +114,10 @@ def _worker(rank, world_size, init_method, tp, ulysses, ring, name, latent_shape
         destroy_distributed_environment()
 
 
-def _run(directory, mode, name, latent_shape, cross_attention="sharded", chunks=1, batch=1):
+def _run(directory, mode, name, latent_shape, cross_attention="sharded", chunks=1, batch=1, fused=False):
     tp, ulysses, ring = MODES[mode] if mode else (1, 1, 1)
     output_path = directory / "output.pt"
-    options = dict(cross_attention=cross_attention, chunks=chunks, batch=batch)
+    options = dict(cross_attention=cross_attention, chunks=chunks, batch=batch, fused=fused)
     spawn_accelerator_ranks(
         _worker,
         directory,
@@ -142,6 +144,18 @@ def one_gpu_output(tmp_path_factory):
 
 def _relative_error(actual, expected):
     return ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
+
+
+@pytest.mark.rocm
+def test_rocshmem_fused_tp_matches_one_gpu(tmp_path, one_gpu_output, monkeypatch):
+    if not hasattr(torch.ops.symm_mem, "_rocshmem_gather_slices"):
+        pytest.skip("requires PyTorch with rocSHMEM AsyncTP support")
+    latent_shape = (9, 46, 42)  # 4,347 real rows: padding and the large-M dispatch both matter.
+    expected = one_gpu_output("wan", latent_shape)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setenv("TORCH_SYMM_MEM_ROCSHMEM_ASYNC_TP", "1")
+    actual = _run(tmp_path, "tp2", "wan", latent_shape, "replicated", fused=True)
+    assert _relative_error(actual, expected) <= TOLERANCE
 
 
 @pytest.mark.parametrize("latent_shape", [UNPADDED, PADDED], ids=["unpadded", "padded"])
