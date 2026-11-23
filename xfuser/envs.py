@@ -64,6 +64,44 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     "XDIT_SDMA_LIB": lambda: os.environ.get("XDIT_SDMA_LIB", ""),
     "XDIT_SDMA_WAIT_S": lambda: os.environ.get("XDIT_SDMA_WAIT_S", "30"),
     "XDIT_SDMA_ALLOW_UNTESTED": lambda: os.environ.get("XDIT_SDMA_ALLOW_UNTESTED", "0"),
+    # How Wan's cross-attention runs under tensor parallelism.
+    #   sharded    - like self-attention: rows gathered into column-parallel Q, row-parallel output
+    #                reduce-scattered (3 all-gathers + 3 reduce-scatters per block).
+    #   replicated - full weights on every rank, applied to the local rows without communication
+    #                (2 + 2 per block), at the memory of one unsharded cross-attention per block.
+    "XDIT_WAN_TP_CROSS_ATTENTION": lambda: os.environ.get("XDIT_WAN_TP_CROSS_ATTENTION", "sharded"),
+    # How tensor parallelism's all-gathers and reduce-scatters meet their GEMMs.
+    #   none    - each collective, then its GEMM (or the reverse), on one stream.
+    #   chunked - pipelined in XDIT_TP_OVERLAP_CHUNKS chunks, RCCL on a side stream
+    #             (benchmarks/tp_comm_gemm_overlap.py measures the gain per site).
+    #   symm_mem - torch's symm_mem fused AG+GEMM / GEMM+RS ops (NVLink; they
+    #             segfault on torch 2.13 / ROCm 7.16). On ROCm, a torch patched with
+    #             patches/pytorch runs them on SDMA engines with TORCH_SYMM_MEM_ENABLE_ROCM_SDMA=1.
+    #   sdma    - ROCm: each all-gather + GEMM with the gather on SDMA copy engines, all peers at
+    #             once, in XDIT_TP_OVERLAP_CHUNKS pieces whose GEMMs start as they land
+    #             (layers/sdma_all_gather.py); reduce-scatters as with chunked.
+    "XDIT_TP_COMM_OVERLAP": lambda: os.environ.get("XDIT_TP_COMM_OVERLAP", "none"),
+    "XDIT_TP_OVERLAP_CHUNKS": lambda: os.environ.get("XDIT_TP_OVERLAP_CHUNKS", "4"),
+    # For sdma: what releases the copies (gpu: a kernel after the symmetric-memory barrier; host:
+    # the host, after waiting for it), and which way they move (push: each rank writes its pieces
+    # into its peers; pull: each rank reads its peers' pieces).
+    "XDIT_TP_SDMA_TRIGGER": lambda: os.environ.get("XDIT_TP_SDMA_TRIGGER", "gpu"),
+    "XDIT_TP_SDMA_DIRECTION": lambda: os.environ.get("XDIT_TP_SDMA_DIRECTION", "push"),
+    # For sdma: seconds a GPU-side wait for a piece (or a symmetric-memory barrier) may take before
+    # it gives up; the op then raises on the next call instead of hanging.
+    "XDIT_TP_SDMA_WAIT_S": lambda: os.environ.get("XDIT_TP_SDMA_WAIT_S", "30"),
+    # For sdma: on, the reduce-scatters too push their partial sums on SDMA engines and reduce
+    # them chunk by chunk; off, they run as with chunked.
+    "XDIT_TP_SDMA_REDUCE_SCATTER": lambda: os.environ.get("XDIT_TP_SDMA_REDUCE_SCATTER", "off"),
+    # For sdma: what a flag wait that gave up does. abort: the stream stays held and a watchdog
+    # thread logs what was missing and aborts the process (no wrong output is used); raise: the
+    # stream moves on (that call's output is wrong) and the next SDMA call raises.
+    "XDIT_TP_SDMA_ON_TIMEOUT": lambda: os.environ.get("XDIT_TP_SDMA_ON_TIMEOUT", "abort"),
+    # For sdma: run on a GPU architecture it has not been validated on (see sdma_all_gather.py).
+    "XDIT_TP_SDMA_ALLOW_UNTESTED": lambda: os.environ.get("XDIT_TP_SDMA_ALLOW_UNTESTED", "0"),
+    # For sdma: a prebuilt transport library (python -m xfuser.model_executor.layers.sdma_all_gather
+    # build); unset, it is built with hipcc on first use and cached.
+    "XDIT_SDMA_LIB": lambda: os.environ.get("XDIT_SDMA_LIB", ""),
 }
 
 
