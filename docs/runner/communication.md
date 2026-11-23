@@ -9,6 +9,7 @@ path and measure your workload before changing the transport.
 | --- | --- | --- |
 | Default | Regular Ulysses collectives | A supported model, layout, and device backend |
 | `--ulysses_a2a sdma` | Uses SDMA copy engines for eligible input and output exchanges | ROCm, one node, and supported dense attention calls |
+| `--ulysses_a2a rocshmem` | Places peer data in PyTorch symmetric memory using rocSHMEM device puts | ROCm `ci-sdma` image, single `gfx950` node |
 | `--use_fp8_comms` | Quantizes eligible Q/K/V and attention-output exchanges | Model support and a pre-quantization attention backend; current kernels use ROCm/AITER |
 | `--attention_a2a` | Replaces the input exchange with AITER's intranode transport | Supported Wan models, ROCm/AITER, and MORI SHMEM |
 
@@ -46,6 +47,33 @@ While SDMA is selected, the runner disables transformer CUDA graphs because its
 host-issued copies cannot replay; other components can retain their graphs.
 `XDIT_SDMA_WAIT_S` sets the wait timeout in seconds (default 30).
 `XDIT_SDMA_ALLOW_UNTESTED=1` permits other GPU architectures.
+
+## PyTorch rocSHMEM transport
+
+The [diffusion-models-inference ROCm CI image](https://github.com/AMD-AGI/diffusion-models-inference/tree/main/docker)
+builds PyTorch. Use its SDMA-enabled recipe and select this xDiT revision via
+`XDIT_COMMIT`. The direct-placement kernel lives here in xDiT; the CI build
+links it into PyTorch's rocSHMEM backend. No separate `XDIT_ROCSHMEM_LIBRARY`
+or `XDIT_SDMA_LIB` is needed in that image. Setting `ROCSHMEM_SDMA_ENABLED=1`
+alone cannot enable SDMA in a wheel built without the backend.
+
+Select `--ulysses_a2a rocshmem` instead of `sdma` at runtime. The default
+transport is unchanged.
+
+The transport supports a full Ulysses group of 2-8 peer-accessible GPUs or
+two equal four-rank CFG groups on eight GPUs (contiguous or even/odd ranks).
+Both CFG branches must create the same size workspaces in the same order:
+heap allocation is world collective, although the payload stays within each
+team. Use one fixed partition per torchrun job. For large shapes, set
+`ROCSHMEM_HEAP_SIZE` in bytes before torchrun if the default heap is too
+small. Head grouping and `--ulysses_sdma_overlap_qkv` are supported;
+per-group attention streams and transformer graph capture are not.
+
+Run the following test from a checkout in the image with eight allocated GPUs:
+
+```bash
+python -m pytest -q tests/integration/accelerator/core/distributed/test_rocshmem_ulysses.py
+```
 
 ## FP8 communication
 

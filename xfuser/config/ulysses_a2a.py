@@ -5,7 +5,7 @@ from dataclasses import dataclass
 # default: the process group's all-to-all (NCCL / RCCL); sdma: the copy engines; packed: the
 # SDMA path's layout and head groups over the default all-to-all (internal: tests and
 # diagnostics, to tell the transport's share of a gain from the layout's).
-ULYSSES_A2A_MODES = ("default", "sdma", "packed")
+ULYSSES_A2A_MODES = ("default", "sdma", "packed", "rocshmem")
 
 
 @dataclass(frozen=True)

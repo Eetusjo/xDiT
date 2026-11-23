@@ -79,7 +79,7 @@ def selected() -> bool:
 
 def uses_sdma() -> bool:
     """Whether Ulysses calls move their data with SDMA copies."""
-    return _config().mode == "sdma"
+    return _config().mode in ("sdma", "rocshmem")
 
 
 def overlap_qkv() -> bool:
@@ -362,7 +362,9 @@ _HOST_ISSUED = (torch.Tag.cudagraph_unsafe,) if hasattr(torch.Tag, "cudagraph_un
 
 @torch.library.custom_op("xfuser::sdma_ulysses_begin", mutates_args=(), tags=_HOST_ISSUED)
 def _sdma_ulysses_begin(ref: torch.Tensor, spec: List[int], group_name: str, mode: str) -> torch.Tensor:
-    ulysses.begin(_group(group_name), ulysses.Exchange.decode(spec, ref.dtype), rccl=mode == "packed")
+    ulysses.begin(
+        _group(group_name), ulysses.Exchange.decode(spec, ref.dtype), rccl=mode == "packed", rocshmem=mode == "rocshmem"
+    )
     return ref.new_empty(0)
 
 
