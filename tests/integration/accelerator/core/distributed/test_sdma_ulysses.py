@@ -56,7 +56,7 @@ def _bhsd(generator, device, batch, seq, heads):
     return x.transpose(1, 2)
 
 
-def exchange_mismatches(group, case, seed, rccl=False, qk_first=False):
+def exchange_mismatches(group, case, seed, rccl=False, qk_first=False, nd=False):
     """Run one exchange and count wrong elements, over every view attention sees and the output.
 
     Each rank all-gathers the inputs to know what each head group's views must hold, joint rows
@@ -105,7 +105,7 @@ def exchange_mismatches(group, case, seed, rccl=False, qk_first=False):
         # Each head group in two sends: Q and K first, then the rest.
         rows = [x.shape[2] for x in tensors]
         exchange = ulysses.Exchange.make(world, batch, HEAD_DIM, q.dtype, rows, heads, reserved, groups)
-        ulysses.begin(group, exchange)
+        ulysses.begin(group, exchange, nd=nd)
         offsets = [0] * len(tensors)
         for gi, group_sizes in enumerate(sizes):
             pieces = [ulysses.pieces_from_heads(x, world, offsets[t], group_sizes[t]) for t, x in enumerate(tensors)]
@@ -175,6 +175,30 @@ def test_sdma_exchange_under_cfg_parallel(accelerator_ranks, world_size):
 
 def test_packed_exchange_over_rccl(accelerator_ranks):
     accelerator_ranks(_exchange_worker, world_size=4, timeout=600, args=(1, True))
+
+
+def _nd_worker(rank, world_size, init_method):
+    from yunchang.globals import PROCESS_GROUP
+    from xfuser.core.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
+
+    try:
+        _setup(rank, world_size, init_method, world_size)
+        for epoch in range(2):
+            for case in (EXCHANGES[4], EXCHANGES[6], EXCHANGES[7]):
+                wrong = exchange_mismatches(PROCESS_GROUP.ULYSSES_PG, case, epoch, qk_first=True, nd=True)
+                assert wrong == 0, (case, epoch, wrong)
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
+def test_symm_mem_nd_split_heads_and_joint_rows(accelerator_ranks, monkeypatch):
+    import torch
+
+    if not hasattr(torch.ops.symm_mem, "rocshmem_all_to_all_nd"):
+        pytest.skip("requires a PyTorch build with rocSHMEM ND collectives")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    accelerator_ranks(_nd_worker, world_size=2, timeout=300)
 
 
 def _split_send_worker(rank, world_size, init_method):
