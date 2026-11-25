@@ -415,6 +415,19 @@ def _copy_own(g, ex, gi, tensors, packed, inbox):
         start += n
 
 
+def send_nd_planes(group, gi, tensors):
+    from . import symm_mem
+
+    c = _state(group).open
+    if c is None or not c.nd or c.sent != gi or c.next_tensor or len(tensors) != c.exchange.tensors:
+        raise RuntimeError("ND plane send requires one complete head group in sequence")
+    pieces = [pieces_from_grouped(t, group.size()) for t in tensors]
+    out, ready = symm_mem.exchange_planes(pieces, group, (gi, "in"))
+    c.groups.append(out)
+    c.ready.append(ready)
+    c.sent += 1
+
+
 def _inbox(buf, offset, b, rows, h, d, dtype):
     elt = torch.empty((), dtype=dtype).element_size()
     return buf.local[offset * elt : (offset + b * rows * h * d) * elt].view(dtype).view(b, rows, h, d)

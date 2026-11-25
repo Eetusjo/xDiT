@@ -38,15 +38,30 @@ def stream_for(device):
 
 def exchange(src, group, slot, scatter_dim, rows):
     """Stage on the producer stream. Return ordinary output and its readiness event."""
+    return _exchange(src, src.numel(), group, slot, scatter_dim, rows, lambda inp: inp.copy_(src.view_as(inp)))
+
+
+def exchange_planes(pieces, group, slot):
+    """Pack equal Q/K/V planes directly into symmetric storage on the producer stream."""
+    first = pieces[0]
+    shape = (group.size(), len(pieces), *first.shape[1:])
+
+    def pack(inp):
+        torch.stack(pieces, dim=1, out=inp.view(shape))
+
+    return _exchange(first, len(pieces) * first.numel(), group, slot, 0, len(pieces), pack)
+
+
+def _exchange(src, numel, group, slot, scatter_dim, rows, fill):
     _initialize(group)
     p = group.size()
-    stage, retired = _buffer(group, slot, src.numel(), src.device, src.dtype)
+    stage, retired = _buffer(group, slot, numel, src.device, src.dtype)
     shape = (p, rows, -1) if scatter_dim == 0 else (rows, p, -1)
     inp = stage.view(shape)
     out = torch.empty_like(inp.transpose(0, 1), memory_format=torch.contiguous_format)
     producer = torch.cuda.current_stream(src.device)
     producer.wait_event(retired)
-    inp.copy_(src.view_as(inp))
+    fill(inp)
     comm = stream_for(src.device)
     comm.wait_stream(producer)
     with torch.cuda.stream(comm):

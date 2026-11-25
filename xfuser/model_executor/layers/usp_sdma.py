@@ -393,6 +393,19 @@ def _(token, packed, group, tensors, group_name):
     return token.new_empty(0)
 
 
+@torch.library.custom_op("xfuser::symm_mem_ulysses_send_planes", mutates_args=(), tags=_HOST_ISSUED)
+def _symm_mem_ulysses_send_planes(
+    token: torch.Tensor, tensors: List[torch.Tensor], group: int, group_name: str
+) -> torch.Tensor:
+    ulysses.send_nd_planes(_group(group_name), group, tensors)
+    return token.new_empty(0)
+
+
+@_symm_mem_ulysses_send_planes.register_fake
+def _(token, tensors, group, group_name):
+    return token.new_empty(0)
+
+
 # A head group's Q/K/V projection after the previous group's send. Inductor would otherwise
 # run every group's GEMM first (it fuses the groups' norm kernels into one) and start no send
 # until the last projection is done. The GEMM is an extern kernel under Inductor either way.
@@ -712,8 +725,11 @@ def grouped_qkv_attention(attn, hidden_states, norm_rope, *, backend, attention_
             qkv = torch.ops.xfuser.sdma_ulysses_linear(token, hidden_states, weight, bias)
         q, k, v = (x.unflatten(-1, (-1, head_dim)) for x in qkv.chunk(3, dim=-1))
         q, k, v = norm_rope(q, k, v)
-        packed.append(ulysses.pack_group([ulysses.pieces_from_grouped(x, world) for x in (q, k, v)]))
-        token = torch.ops.xfuser.sdma_ulysses_send(token, packed[-1], g, [], group.group_name)
+        if _config().mode == "symm_mem":
+            token = torch.ops.xfuser.symm_mem_ulysses_send_planes(token, [q, k, v], g, group.group_name)
+        else:
+            packed.append(ulysses.pack_group([ulysses.pieces_from_grouped(x, world) for x in (q, k, v)]))
+            token = torch.ops.xfuser.sdma_ulysses_send(token, packed[-1], g, [], group.group_name)
     return finish(
         token,
         packed,
