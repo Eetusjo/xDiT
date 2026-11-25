@@ -379,8 +379,6 @@ def send(
                 got, ready = symm_mem.exchange(src, process_group, (gi, "in"), 0, planes)
                 c.groups.append(got)
                 c.ready.append(ready)
-                if len(parts) != 1:
-                    c.packed.append(src)
             else:
                 c.groups.append(src.reshape(-1))
             c.parts = []
@@ -551,8 +549,7 @@ def _finish_nd(group, c, attend, local, concurrent):
                 views = _packed_views(c.groups[gi], ex, gi, local, _nd_planes(ex, gi))
                 h = ex.sizes[gi][0]
                 out = attend(*views).transpose(1, 2).to(ex.dtype)
-                back = out.reshape(b, p, s, h, d).permute(1, 0, 2, 3, 4)
-                c.packed.append(back)
+                back = out.reshape(b, p, s, h, d).permute(1, 0, 2, 3, 4).contiguous()
                 # With a single logical row the ND pull reads a whole shard per peer.
                 returns.append(symm_mem.exchange(back, group, (gi, "out"), 1, 1))
         for gi, (returned, ready) in enumerate(returns):
