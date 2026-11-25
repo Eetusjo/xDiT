@@ -224,9 +224,9 @@ def pack_group(pieces: Sequence[torch.Tensor]) -> torch.Tensor:
 class _Call:
     """One open call on a Ulysses group, from `begin` to `finish`."""
 
-    def __init__(self, exchange, call: Optional[interface.Call]):
+    def __init__(self, exchange, call: Optional[interface.Call], nd: bool = False):
         # `call` is the transport's, or None over RCCL.
-        self.exchange, self.call, self.rccl = exchange, call, call is None
+        self.exchange, self.call = exchange, call
         # The packed tensors sent, held until `finish` returns: the transport reads them until
         # every peer has the data, which this rank knows only once the peers' outputs are back.
         self.packed: List[torch.Tensor] = []
@@ -235,6 +235,8 @@ class _Call:
         # Over RCCL: the current group's parts, joined per peer once the group is complete.
         self.parts: List[torch.Tensor] = []
         self.groups: List[torch.Tensor] = []
+        self.nd = nd
+        self.ready: List[torch.cuda.Event] = []
 
 
 class _State:
@@ -325,7 +327,7 @@ def host_issued() -> bool:
     return transport.PeerGroup.host_issued
 
 
-def begin(process_group: dist.ProcessGroup, exchange: Exchange, rccl: bool = False) -> None:
+def begin(process_group: dist.ProcessGroup, exchange: Exchange, rccl: bool = False, nd: bool = False) -> None:
     """Open a call on `process_group`. With `rccl`, or while a CUDA graph is being captured and
     the transport issues its copies from the host (a graph would not replay them), the call
     exchanges the same packed tensors with RCCL."""
@@ -335,6 +337,11 @@ def begin(process_group: dist.ProcessGroup, exchange: Exchange, rccl: bool = Fal
     world = dist.get_world_size(process_group)
     if exchange.world != world:
         raise ValueError(f"exchange for {exchange.world} ranks on a group of {world}")
+    if nd:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("symm_mem Ulysses does not support graph capture")
+        state.open = _Call(exchange, None, nd=True)
+        return
     if rccl or (host_issued() and torch.cuda.is_current_stream_capturing()):
         state.open = _Call(exchange, None)
         return
@@ -360,11 +367,20 @@ def send(
     if not tensors or tensors != tuple(range(c.next_tensor, c.next_tensor + len(tensors))) or tensors[-1] >= ex.tensors:
         raise ValueError(f"group {gi}: send its tensors in order from {c.next_tensor}; got {tensors}")
     last = tensors[-1] == ex.tensors - 1
-    if c.rccl:
+    if c.call is None:
         c.parts.append(packed)
         if last:
             parts = [part.view(ex.world, -1) for part in c.parts]
-            c.groups.append(parts[0].reshape(-1) if len(parts) == 1 else torch.cat(parts, dim=1).reshape(-1))
+            src = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
+            if c.nd:
+                from . import symm_mem
+
+                planes = _nd_planes(ex, gi)
+                got, ready = symm_mem.exchange(src, process_group, (gi, "in"), 0, planes)
+                c.groups.append(got)
+                c.ready.append(ready)
+            else:
+                c.groups.append(src.reshape(-1))
             c.parts = []
     else:
         g = transport.group_for(process_group)
@@ -424,7 +440,9 @@ def finish(
     if c is None or c.sent != c.exchange.groups:
         raise RuntimeError("SDMA Ulysses finish before every group was sent")
     state.open = None
-    if c.rccl:
+    if c.nd:
+        return _finish_nd(process_group, c, attend, local, concurrent)
+    if c.call is None:
         return _finish_rccl(process_group, c.exchange, c.groups, attend, local)
     g = transport.group_for(process_group)
     ex, P, r, b, d, G = c.exchange, g.world, g.rank, c.exchange.batch, c.exchange.head_dim, c.exchange.groups
@@ -489,6 +507,65 @@ def _outbox(outbox, ex, gi, elt):
     return outbox.local[start : start + P * b * s * h * d * elt].view(ex.dtype).view(P, b, s, h, d)
 
 
+def _nd_planes(ex, gi):
+    sizes = [ex.piece_elems(gi, t) for t in range(ex.tensors)]
+    return ex.tensors if len(set(sizes)) == 1 else 1
+
+
+def _packed_views(got, ex, gi, local, planes):
+    p, b, d = ex.world, ex.batch, ex.head_dim
+    rows = got.view(planes, p, -1)
+    views, start = [], 0
+    for t in range(ex.tensors):
+        h, st = ex.sizes[gi][t], ex.rows[t]
+        n = ex.piece_elems(gi, t)
+        piece = rows[t] if planes > 1 else rows[0, :, start : start + n]
+        x = piece.view(p, b, st, h, d).permute(1, 0, 2, 3, 4).reshape(b, p * st, h, d)
+        before, after = ex.reserved[t]
+        if local is not None and local[t] is not None and before + after:
+            own = local[t][:, ex.head_offset(gi, t) : ex.head_offset(gi, t) + h].transpose(1, 2)
+            x = torch.cat([own[:, :before], x, own[:, before:]], dim=1)
+        views.append(x.transpose(1, 2))
+        start += n
+    return views
+
+
+def _finish_nd(group, c, attend, local, concurrent):
+    from . import symm_mem
+
+    ex = c.exchange
+    p, b, s, d = ex.world, ex.batch, ex.rows[0], ex.head_dim
+    dev = c.groups[0].device
+    main = torch.cuda.current_stream(dev)
+    streams = _streams(dev, ex.groups) if concurrent else [main] * ex.groups
+    result = torch.empty(b, s, p, ex.heads[0], d, dtype=ex.dtype, device=dev)
+    returns = []
+    try:
+        for gi, stream in enumerate(streams):
+            if concurrent:
+                stream.wait_stream(main)
+            with torch.cuda.stream(stream):
+                stream.wait_event(c.ready[gi])
+                views = _packed_views(c.groups[gi], ex, gi, local, _nd_planes(ex, gi))
+                h = ex.sizes[gi][0]
+                out = attend(*views).transpose(1, 2).to(ex.dtype)
+                back = out.reshape(b, p, s, h, d).permute(1, 0, 2, 3, 4).contiguous()
+                # With a single logical row the ND pull reads a whole shard per peer.
+                returns.append(symm_mem.exchange(back, group, (gi, "out"), 1, 1))
+        for gi, (returned, ready) in enumerate(returns):
+            main.wait_event(ready)
+            h, off = ex.sizes[gi][0], ex.head_offset(gi, 0)
+            result[:, :, :, off : off + h].copy_(returned.view(p, b, s, h, d).permute(1, 2, 0, 3, 4))
+    finally:
+        # Rejoin all readers before their allocation streams can recycle temporary storage.
+        main.wait_stream(symm_mem.stream_for(dev))
+        if concurrent:
+            for stream in streams:
+                main.wait_stream(stream)
+                stream.wait_stream(main)
+    return result.view(b, s, p * ex.heads[0], d)
+
+
 def _finish_rccl(process_group, ex, packed, attend, local):
     """`finish` for a call that exchanges its packed tensors with RCCL all-to-alls."""
     P, b, d = ex.world, ex.batch, ex.head_dim
@@ -497,18 +574,7 @@ def _finish_rccl(process_group, ex, packed, attend, local):
     for gi in range(ex.groups):
         got = torch.empty_like(packed[gi])
         dist.all_to_all_single(got, packed[gi], group=process_group)
-        rows = got.view(P, -1)
-        views, start = [], 0
-        for t in range(ex.tensors):
-            h, st = ex.sizes[gi][t], ex.rows[t]
-            n = ex.piece_elems(gi, t)
-            x = rows[:, start : start + n].view(P, b, st, h, d).permute(1, 0, 2, 3, 4).reshape(b, P * st, h, d)
-            before, after = ex.reserved[t]
-            if local is not None and local[t] is not None and before + after:
-                own = local[t][:, ex.head_offset(gi, t) : ex.head_offset(gi, t) + h].transpose(1, 2)
-                x = torch.cat([own[:, :before], x, own[:, before:]], dim=1)
-            views.append(x.transpose(1, 2))
-            start += n
+        views = _packed_views(got, ex, gi, local, 1)
         out = attend(*views).transpose(1, 2).to(ex.dtype)
         h = ex.sizes[gi][0]
         back = out.reshape(b, P, s, h, d).permute(1, 0, 2, 3, 4).contiguous()

@@ -39,7 +39,16 @@ use, or loads a prebuilt library from `XDIT_SDMA_LIB`. See the
 | `--ulysses_sdma_group_streams` | Runs each group's attention on a separate stream. |
 | `--ulysses_sdma_overlap_qkv` | Overlaps projection with exchange. MiniMax-H3 and FLUX.3 project per group and retain a second Q/K/V weight copy. Wan sends Q/K before projecting V, without that copy. With CPU offload, only Wan's approach applies. |
 
-These options require `--ulysses_a2a sdma`. Unsupported calls fall back to regular
+To test the PyTorch ND transport instead of ROCr, set `--ulysses_a2a symm_mem`.
+Use an SDMA-enabled ROCm PyTorch build with `symm_mem.all_to_all_nd` and
+the rocSHMEM provider. Each rank stages its packed input in symmetric memory;
+the peers read that input into ordinary output tensors. All ranks on one node
+must participate in the same allocation sequence. Use one Ulysses group or
+two equal CFG teams of four on eight GPUs. This path does not support graph
+capture. Set `ROCSHMEM_SDMA_ENABLED=1`; the runtime threshold determines
+whether the data transfers use SDMA.
+
+The head-group options above apply to `sdma` and `symm_mem`. Unsupported calls fall back to regular
 collectives with a warning: Ring, FP8 communication, PipeFusion KV caching, head
 balancing, sparse kernels, attention masks, and certain padded joint-text layouts.
 While SDMA is selected, the runner disables transformer CUDA graphs because its

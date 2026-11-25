@@ -297,6 +297,7 @@ def test_q_k_first_modules_are_reported_with_their_one_head_group(monkeypatch, r
     [
         ("reduce-overhead", "sdma", 8, "default"),
         ("max-autotune", "sdma", 8, "max-autotune-no-cudagraphs"),
+        ("reduce-overhead", "symm_mem", 8, "default"),
         ("default", "sdma", 8, "default"),
         ("reduce-overhead", "sdma", 1, "reduce-overhead"),
         ("reduce-overhead", "packed", 8, "reduce-overhead"),

@@ -79,7 +79,7 @@ def selected() -> bool:
 
 def uses_sdma() -> bool:
     """Whether Ulysses calls move their data with SDMA copies."""
-    return _config().mode == "sdma"
+    return _config().mode in ("sdma", "symm_mem")
 
 
 def overlap_qkv() -> bool:
@@ -90,11 +90,13 @@ def compile_mode(mode: str) -> str:
     """The torch.compile mode for a component whose Ulysses attention takes this path: without
     CUDA graphs when the transport issues its copies from the host. With graphs, Inductor runs
     the ops between graph partitions, which costs a step more than the graphs save."""
-    if mode not in _WITHOUT_CUDAGRAPHS or not uses_sdma() or not ulysses.host_issued():
+    if mode not in _WITHOUT_CUDAGRAPHS or not uses_sdma():
+        return mode
+    if _config().mode == "sdma" and not ulysses.host_issued():
         return mode
     if get_ulysses_parallel_world_size() <= 1:
         return mode
-    warn_once(logger, f"--ulysses_a2a sdma: compiling the transformer with mode {_WITHOUT_CUDAGRAPHS[mode]!r}.")
+    warn_once(logger, f"--ulysses_a2a {_config().mode}: compiling the transformer with mode {_WITHOUT_CUDAGRAPHS[mode]!r}.")
     return _WITHOUT_CUDAGRAPHS[mode]
 
 
@@ -362,7 +364,9 @@ _HOST_ISSUED = (torch.Tag.cudagraph_unsafe,) if hasattr(torch.Tag, "cudagraph_un
 
 @torch.library.custom_op("xfuser::sdma_ulysses_begin", mutates_args=(), tags=_HOST_ISSUED)
 def _sdma_ulysses_begin(ref: torch.Tensor, spec: List[int], group_name: str, mode: str) -> torch.Tensor:
-    ulysses.begin(_group(group_name), ulysses.Exchange.decode(spec, ref.dtype), rccl=mode == "packed")
+    ulysses.begin(
+        _group(group_name), ulysses.Exchange.decode(spec, ref.dtype), rccl=mode == "packed", nd=mode == "symm_mem"
+    )
     return ref.new_empty(0)
 
 
