@@ -236,6 +236,7 @@ class _Call:
         self.parts: List[torch.Tensor] = []
         self.groups: List[torch.Tensor] = []
         self.nd = nd
+        self.nd_inputs = [[] for _ in exchange.sizes] if nd else []
         self.ready: List[torch.cuda.Event] = []
 
 
@@ -367,20 +368,22 @@ def send(
     if not tensors or tensors != tuple(range(c.next_tensor, c.next_tensor + len(tensors))) or tensors[-1] >= ex.tensors:
         raise ValueError(f"group {gi}: send its tensors in order from {c.next_tensor}; got {tensors}")
     last = tensors[-1] == ex.tensors - 1
-    if c.call is None:
+    if c.nd:
+        from . import symm_mem
+
+        sizes = [ex.piece_elems(gi, t) for t in tensors]
+        planes = len(sizes) if len(set(sizes)) == 1 else 1
+        got, ready = symm_mem.exchange(packed, process_group, (gi, "in", tensors), 0, planes)
+        c.nd_inputs[gi].append((got, tensors))
+        if last:
+            # All parts use the same communication stream.
+            c.ready.append(ready)
+    elif c.call is None:
         c.parts.append(packed)
         if last:
             parts = [part.view(ex.world, -1) for part in c.parts]
             src = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
-            if c.nd:
-                from . import symm_mem
-
-                planes = _nd_planes(ex, gi)
-                got, ready = symm_mem.exchange(src, process_group, (gi, "in"), 0, planes)
-                c.groups.append(got)
-                c.ready.append(ready)
-            else:
-                c.groups.append(src.reshape(-1))
+            c.groups.append(src.reshape(-1))
             c.parts = []
     else:
         g = transport.group_for(process_group)
@@ -423,7 +426,7 @@ def send_nd_planes(group, gi, tensors):
         raise RuntimeError("ND plane send requires one complete head group in sequence")
     pieces = [pieces_from_grouped(t, group.size()) for t in tensors]
     out, ready = symm_mem.exchange_planes(pieces, group, (gi, "in"))
-    c.groups.append(out)
+    c.nd_inputs[gi].append((out, range(c.exchange.tensors)))
     c.ready.append(ready)
     c.sent += 1
 
@@ -520,19 +523,14 @@ def _outbox(outbox, ex, gi, elt):
     return outbox.local[start : start + P * b * s * h * d * elt].view(ex.dtype).view(P, b, s, h, d)
 
 
-def _nd_planes(ex, gi):
-    sizes = [ex.piece_elems(gi, t) for t in range(ex.tensors)]
-    return ex.tensors if len(set(sizes)) == 1 else 1
-
-
-def _packed_views(got, ex, gi, local, planes):
+def _packed_views(got, ex, gi, local, planes, tensors=None):
     p, b, d = ex.world, ex.batch, ex.head_dim
     rows = got.view(planes, p, -1)
     views, start = [], 0
-    for t in range(ex.tensors):
+    for plane, t in enumerate(range(ex.tensors) if tensors is None else tensors):
         h, st = ex.sizes[gi][t], ex.rows[t]
         n = ex.piece_elems(gi, t)
-        piece = rows[t] if planes > 1 else rows[0, :, start : start + n]
+        piece = rows[plane] if planes > 1 else rows[0, :, start : start + n]
         x = piece.view(p, b, st, h, d).permute(1, 0, 2, 3, 4).reshape(b, p * st, h, d)
         before, after = ex.reserved[t]
         if local is not None and local[t] is not None and before + after:
@@ -548,7 +546,7 @@ def _finish_nd(group, c, attend, local, concurrent):
 
     ex = c.exchange
     p, b, s, d = ex.world, ex.batch, ex.rows[0], ex.head_dim
-    dev = c.groups[0].device
+    dev = c.nd_inputs[0][0][0].device
     main = torch.cuda.current_stream(dev)
     streams = _streams(dev, ex.groups) if concurrent else [main] * ex.groups
     result = torch.empty(b, s, p, ex.heads[0], d, dtype=ex.dtype, device=dev)
@@ -559,7 +557,9 @@ def _finish_nd(group, c, attend, local, concurrent):
                 stream.wait_stream(main)
             with torch.cuda.stream(stream):
                 stream.wait_event(c.ready[gi])
-                views = _packed_views(c.groups[gi], ex, gi, local, _nd_planes(ex, gi))
+                views = []
+                for got, tensors in c.nd_inputs[gi]:
+                    views.extend(_packed_views(got, ex, gi, local, got.size(0), tensors))
                 h = ex.sizes[gi][0]
                 out = attend(*views).transpose(1, 2).to(ex.dtype)
                 back = out.reshape(b, p, s, h, d).permute(1, 0, 2, 3, 4).contiguous()
