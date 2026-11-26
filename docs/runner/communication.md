@@ -41,8 +41,9 @@ use, or loads a prebuilt library from `XDIT_SDMA_LIB`. See the
 
 To test the PyTorch ND transport instead of ROCr, set `--ulysses_a2a symm_mem`.
 Use an SDMA-enabled ROCm PyTorch build with `symm_mem.all_to_all_nd` and
-the rocSHMEM provider. Each rank stages its packed input in symmetric memory;
-the peers read that input into ordinary output tensors. All ranks on one node
+the rocSHMEM provider. Each rank stages its input in symmetric memory.
+The grouped projection packs equal Q/K/V planes directly into that storage;
+other paths copy the packed input. Peers read it into ordinary output tensors. All ranks on one node
 must participate in the same allocation sequence. Use one Ulysses group or
 two equal CFG teams of four on eight GPUs. This path does not support graph
 capture. Set `ROCSHMEM_SDMA_ENABLED=1`; the runtime threshold determines

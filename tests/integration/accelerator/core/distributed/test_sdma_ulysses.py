@@ -101,8 +101,7 @@ def exchange_mismatches(group, case, seed, rccl=False, qk_first=False, nd=False)
     kv = (joint_rows, 0) if front else (0, joint_rows)
     reserved = [(0, 0), kv, kv] + [(0, 0)] * extras
     local = [None, *joint] + [None] * extras if joint else None
-    if qk_first:
-        # Each head group in two sends: Q and K first, then the rest.
+    if qk_first or nd:
         rows = [x.shape[2] for x in tensors]
         exchange = ulysses.Exchange.make(world, batch, HEAD_DIM, q.dtype, rows, heads, reserved, groups)
         ulysses.begin(group, exchange, nd=nd)
@@ -110,8 +109,12 @@ def exchange_mismatches(group, case, seed, rccl=False, qk_first=False, nd=False)
         for gi, group_sizes in enumerate(sizes):
             pieces = [ulysses.pieces_from_heads(x, world, offsets[t], group_sizes[t]) for t, x in enumerate(tensors)]
             offsets = [o + h for o, h in zip(offsets, group_sizes)]
-            ulysses.send(group, gi, ulysses.pack_group(pieces[:2]), (0, 1))
-            ulysses.send(group, gi, ulysses.pack_group(pieces[2:]))
+            if nd and not qk_first:
+                grouped = [x.permute(1, 2, 0, 3, 4).flatten(2, 3) for x in pieces]
+                ulysses.send_nd_planes(group, gi, grouped)
+            else:
+                ulysses.send(group, gi, ulysses.pack_group(pieces[:2]), (0, 1))
+                ulysses.send(group, gi, ulysses.pack_group(pieces[2:]))
         out = ulysses.finish(group, attend, local, concurrent)
     else:
         out = ulysses.attention(tensors, attend, group, groups, concurrent, reserved, local, rccl)
@@ -184,6 +187,7 @@ def _nd_worker(rank, world_size, init_method):
     try:
         _setup(rank, world_size, init_method, world_size)
         for epoch in range(2):
+            assert exchange_mismatches(PROCESS_GROUP.ULYSSES_PG, EXCHANGES[4], epoch, nd=True) == 0
             for case in (EXCHANGES[4], EXCHANGES[6], EXCHANGES[7]):
                 wrong = exchange_mismatches(PROCESS_GROUP.ULYSSES_PG, case, epoch, qk_first=True, nd=True)
                 assert wrong == 0, (case, epoch, wrong)
