@@ -97,6 +97,28 @@ def test_joint_text_split_send(fake):
     ]
 
 
+def test_nd_starts_each_partial_send_without_waiting_for_value(fake, monkeypatch):
+    from xfuser.core.distributed.sdma import symm_mem
+
+    _, group = fake(0)
+    calls = []
+
+    def exchange(src, pg, slot, scatter_dim, rows):
+        calls.append((slot, src.tolist()))
+        return src, None
+
+    monkeypatch.setattr(symm_mem, "exchange", exchange)
+    ex = ulysses.Exchange.make(2, 1, 1, torch.float32, [1] * 3, [1] * 3, [(0, 0)] * 3, 1)
+    ulysses.begin(group, ex, nd=True)
+    qk = torch.tensor([10.0, 20.0, 11.0, 21.0])
+    value = torch.tensor([30.0, 31.0])
+    ulysses.send(group, 0, qk, (0, 1))
+    assert [data for _, data in calls] == [qk.tolist()]
+    ulysses.send(group, 0, value)
+    assert [data for _, data in calls] == [qk.tolist(), value.tolist()]
+    assert calls[0][0] != calls[1][0]
+
+
 def test_grouped_query_head_groups(fake):
     # Rank 0 of 2, bf16, head dim 2, 2 rows each. Q: 4 heads, K/V: 2 heads, in 2 head groups of
     # 2 Q heads and 1 K/V head.
